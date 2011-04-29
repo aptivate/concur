@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import re
+import os
+import subprocess
 
 try:
     import wx
@@ -193,10 +195,11 @@ partition_types = {
 }
 
 class Device(object):
-    def __init__(self, name, size, type=0):
+    def __init__(self, name, size, type=0, desc=None):
         self._name = name
         self._size = size
         self._type = type
+        self._desc = desc
         
     @property
     def name(self):
@@ -209,6 +212,10 @@ class Device(object):
     @property
     def type(self):
         return self._type
+
+    @property
+    def desc(self):
+        return self._desc
     
     def humanSize(self):
         value = self._size
@@ -232,10 +239,10 @@ class Device(object):
         if self.type in partition_types:
             return partition_types[self.type]
         else:
-            return "Unknown type 0x%02x" % self.type
+            return "Unknown type %02x" % self.type
             
     def humanLabel(self):
-        return "%s (%s, %s)" % (self.name, self.typeString(),
+        return "%s (%s, %s)" % (self.name, self.desc,
             self.humanSize())
 
 class MainWindow(wx.Frame):
@@ -246,31 +253,63 @@ class MainWindow(wx.Frame):
         self.initialize()
 
     def readPartitions(self):
-        p = open('/proc/partitions', 'r')
-        p.readline() # discard
-        p.readline() # discard
         self.devices = list()
         
-        for line in p:
-            found = re.match(r"""(?x) # allow whitespace and comments
-                \s* # spaces at the beginning of the line
-                (\d+) # first number, major device number
-                \s+ # more spaces
-                (\d+) # second number, minor device number
-                \s+ # more spaces
-                (\d+) # third number, device size in blocks
-                \s+ # more spaces
-                (\S+) # device name without /dev/
-                \s* # optional spaces 
-                \n # newline left in by readline()""",
-                line)
+        for devname in os.listdir("/sys/block/"):
+            # ignore loop and ramdisk devices, not very interesting to us
+            if (re.match(r"(loop|ram)\d+", devname)):
+                continue
             
-            if not found:
-                raise StandardError('Unknown line format in ' +
-                    '/proc/partitions: ' + line)
+            sfdisk = subprocess.Popen(['sfdisk', '-l', '-uS', '/dev/' + devname],
+                stdout = subprocess.PIPE, stderr = subprocess.PIPE)
             
-            self.devices.append(Device(found.group(4),
-                int(found.group(3)) * 1024))
+            if not sfdisk:
+                raise StandardError('sfdisk failed' % returnCode)
+                
+            sfout = sfdisk.stdout
+            
+            line = sfout.readline()
+            if line != '\n':
+                raise StandardError('Unknown output from sfdisk: %s' % line)
+                
+            line = sfout.readline()
+            if not re.match(r'Disk /dev/' + devname + ': .*', line):
+                raise StandardError('Unknown output from sfdisk: %s' % line)
+
+            line = sfout.readline()
+            if not re.match(r'Units = sectors of 512 bytes, counting from 0.*', line):
+                raise StandardError('Unknown output from sfdisk: %s' % line)
+
+            line = sfout.readline()
+            if line != '\n':
+                raise StandardError('Unknown output from sfdisk: %s' % line)
+                
+            #    Device Boot    Start       End   #sectors  Id  System
+            line = sfout.readline()
+            if not re.match(r'\s+Device\s+Boot\s+Start\s+End\s+#sectors' +
+                '\s+Id\s+System', line):
+                raise StandardError('Unknown output from sfdisk: %s' % line)
+
+            for line in sfout.readlines():
+                # /dev/sda1   *      2048 607444991  607442944  83  Linux
+                found = re.match('/dev/(' + devname + r'\d+)' +
+                    r'\s+(\*)?\s+\d+\s+\S+\s+(\d+)\s+(\d+)\s+(.+)', line)
+                
+                if not found:
+                    raise StandardError('Unknown line format from ' +
+                        'sfdisk: ' + line)
+                
+                if found.group(4) == '0':
+                    # empty partition table entry
+                    continue
+                    
+                self.devices.append(Device(found.group(1),
+                    int(found.group(3)) * 512,
+                    int(found.group(4)), found.group(5)))
+            
+            returnCode = sfdisk.wait()
+            if returnCode != 0:
+                raise StandardError('sfdisk returned %d' % returnCode)
         
     def addWithLabel(self, label, control, position):
         self.gridSizer.Add(wx.StaticText(self, label=label), position,
