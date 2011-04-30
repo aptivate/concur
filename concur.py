@@ -217,6 +217,7 @@ class Device(object):
     def desc(self):
         return self._desc
     
+    @property
     def humanSize(self):
         value = self._size
         units = "bytes"
@@ -235,17 +236,23 @@ class Device(object):
         
         return "%.1f %s" % (value, units)
         
+    @property
     def typeString(self):
         if self.type in partition_types:
             return partition_types[self.type]
         else:
             return "Unknown type %02x" % self.type
             
+    @property
     def humanLabel(self):
         return "%s (%s, %s)" % (self.name, self.desc,
-            self.humanSize())
+            self.humanSize)
 
-class Endpoint:
+    @property
+    def conciseString(self):
+        return "/dev/%s" % self.name
+
+class Endpoint(object):
     @property
     def name(self):
         return self._name
@@ -286,6 +293,18 @@ class LocalDevice(Endpoint):
     @property
     def hasDevice(self):
         return True
+    
+    @property
+    def device(self):
+        return self._device
+        
+    @device.setter
+    def device(self, device):
+        self._device = device
+
+    @property
+    def description(self):
+        return self._device.conciseString
 
 class ImageFile(Endpoint):
     @property
@@ -295,6 +314,18 @@ class ImageFile(Endpoint):
     @property
     def hasImageFile(self):
         return True
+
+    @property
+    def imageFile(self):
+        return self._imageFile
+
+    @imageFile.setter
+    def imageFile(self, imageFile):
+        self._imageFile = imageFile
+
+    @property    
+    def description(self):
+        return self._imageFile
 
 class GenericServer(Endpoint):
     @property
@@ -333,7 +364,10 @@ class MulticastNetwork(Endpoint):
     def name(self):
         return "Multicast network"
 
-endpoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
+sourcePoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
+    SmbServer(), MulticastNetwork()]
+
+destPoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
     SmbServer(), MulticastNetwork()]
 
 devices = list()
@@ -343,12 +377,14 @@ class InitialSelectionEvent(wx.PyCommandEvent):
         return 0
 
 class EndpointSetter:
-    def __init__(self, frame, column, isDestination):
+    def __init__(self, frame, items, column, isDestination):
+        self.endpoints = items
+        
         self.typeBox = frame.addChoiceControl('Type',
-            [ep.name for ep in endpoints], (1, column))
+            [ep.name for ep in items], (1, column))
         
         self.devBox = frame.addChoiceControl('Device',
-            [dev.humanLabel() for dev in devices],
+            [dev.humanLabel for dev in devices],
             (2, column))
 
         if isDestination:
@@ -361,14 +397,32 @@ class EndpointSetter:
                 wildcard="Image files (*.img)|*.img|All files|*",
                 style=flpStyle), (3, column))
                 
-        frame.Bind(wx.EVT_CHOICE, self.TypeChange, self.typeBox)
-        self.TypeChange(InitialSelectionEvent())
+        frame.Bind(wx.EVT_CHOICE, self.OnTypeChange, self.typeBox)
+        self.OnTypeChange()
+
+        frame.Bind(wx.EVT_CHOICE, self.OnDeviceChange, self.devBox)
+        if self.endpoint.hasDevice:
+            self.OnDeviceChange()
+
+        frame.Bind(wx.EVT_FILEPICKER_CHANGED, self.OnImageFileChange,
+            self.imageFileBox)
+        if self.endpoint.hasImageFile:
+            self.OnImageFileChange()
     
-    def TypeChange(self, event):
-        i = event.GetSelection()
-        ep = endpoints[i]
-        self.devBox.Enable(ep.hasDevice)
-        self.imageFileBox.Enable(ep.hasImageFile)
+    def OnTypeChange(self):
+        self.endpoint = self.endpoints[self.typeBox.Selection]
+        self.devBox.Enable(self.endpoint.hasDevice)
+        self.imageFileBox.Enable(self.endpoint.hasImageFile)
+
+    def OnDeviceChange(self):
+        self.endpoint.device = devices[self.devBox.Selection]
+
+    def OnImageFileChange(self):
+        self.endpoint.imageFile = self.imageFileBox.Path
+        
+    @property
+    def description(self):
+        return self.endpoint.description
 
 class MainWindow(wx.Frame):
     def __init__(self,parent,id,title):
@@ -446,8 +500,8 @@ class MainWindow(wx.Frame):
         self.addWithLabel(label, choiceControl, position)
         return choiceControl
         
-    def addSourceOrDestOptions(self, column, isDestination):
-        EndpointSetter(self, column, isDestination)
+    def addSourceOrDestOptions(self, items, column, isDestination):
+        return EndpointSetter(self, items, column, isDestination)
 
     def initialize(self):
         self.colSizer = wx.BoxSizer(orient=wx.VERTICAL)
@@ -464,15 +518,15 @@ class MainWindow(wx.Frame):
         self.gridSizer = wx.GridBagSizer(borderWidth, borderWidth)
         self.colSizer.AddF(self.gridSizer, colFlags.Proportion(1))
         
-        self.gridSizer.Add(wx.StaticText(self, label='Source'), (0,1), # (1,2),
+        self.gridSizer.Add(wx.StaticText(self, label='Source'), (0,1),
             flag=wx.ALIGN_CENTER)
-        self.gridSizer.Add(wx.StaticText(self, label='Method'), (0,3), # (1,2),
+        self.gridSizer.Add(wx.StaticText(self, label='Method'), (0,3),
             flag=wx.ALIGN_CENTER)
-        self.gridSizer.Add(wx.StaticText(self, label='Destination'), (0,5), # (1,2),
+        self.gridSizer.Add(wx.StaticText(self, label='Destination'), (0,5),
             flag=wx.ALIGN_CENTER)
 
-        self.addSourceOrDestOptions(0, False)
-        self.addSourceOrDestOptions(4, True)
+        self.source = self.addSourceOrDestOptions(sourcePoints, 0, False)
+        self.dest = self.addSourceOrDestOptions(destPoints, 4, True)
 
         method_choices = ('Raw copy', 'Smart partition copy',
             'MBR copy', 'Rescue copy')
@@ -498,9 +552,16 @@ class MainWindow(wx.Frame):
         self.startButton = wx.Button(self, id=wx.ID_OK)
         self.buttonSizer.Add(self.startButton)
         self.buttonSizer.SetAffirmativeButton(self.startButton)
+        self.Bind(wx.EVT_BUTTON, self.OnStartCopy, self.startButton)
         
         self.SetSizerAndFit(self.colSizer)
         self.Show(True)
+   
+    def OnStartCopy(self, event):
+        prog = wx.ProgressDialog("Copying",
+            "Copying from %s to %s" % (self.source.description,
+                self.dest.description),
+            parent=self, style=wx.PD_CAN_ABORT | wx.PD_ESTIMATED_TIME)
 
 if __name__ == "__main__":
     app = wx.App()
