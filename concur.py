@@ -252,31 +252,31 @@ class Endpoint:
     
     @property
     def hasDevice(self):
-        return false
+        return False
             
     @property
     def hasImageFile(self):
-        return false
+        return False
 
     @property
     def hasServerName(self):
-        return false
+        return False
 
     @property
     def hasServerUser(self):
-        return false
+        return False
 
     @property
     def hasServerPassword(self):
-        return false
+        return False
 
     @property
     def hasShareShare(self):
-        return false
+        return False
 
     @property
     def hasServerPath(self):
-        return false
+        return False
 
 class LocalDevice(Endpoint):
     @property
@@ -285,7 +285,7 @@ class LocalDevice(Endpoint):
 
     @property
     def hasDevice(self):
-        return true
+        return True
 
 class ImageFile(Endpoint):
     @property
@@ -294,24 +294,24 @@ class ImageFile(Endpoint):
 
     @property
     def hasImageFile(self):
-        return true
+        return True
 
 class GenericServer(Endpoint):
     @property
     def hasServerName(self):
-        return true
+        return True
 
     @property
     def hasServerUser(self):
-        return true
+        return True
 
     @property
     def hasServerPassword(self):
-        return true
+        return True
 
     @property
     def hasServerPath(self):
-        return true
+        return True
 
 class FtpServer(GenericServer):
     @property
@@ -336,6 +336,40 @@ class MulticastNetwork(Endpoint):
 endpoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
     SmbServer(), MulticastNetwork()]
 
+devices = list()
+
+class InitialSelectionEvent(wx.PyCommandEvent):
+    def GetSelection(self):
+        return 0
+
+class EndpointSetter:
+    def __init__(self, frame, column, isDestination):
+        self.typeBox = frame.addChoiceControl('Type',
+            [ep.name for ep in endpoints], (1, column))
+        
+        self.devBox = frame.addChoiceControl('Device',
+            [dev.humanLabel() for dev in devices],
+            (2, column))
+
+        if isDestination:
+            flpStyle = wx.FLP_SAVE | wx.FLP_OVERWRITE_PROMPT
+        else:
+            flpStyle = wx.FLP_OPEN | wx.FLP_FILE_MUST_EXIST
+        
+        self.imageFileBox = frame.addWithLabel('Image file',
+            wx.FilePickerCtrl(frame,
+                wildcard="Image files (*.img)|*.img|All files|*",
+                style=flpStyle), (3, column))
+                
+        frame.Bind(wx.EVT_CHOICE, self.TypeChange, self.typeBox)
+        self.TypeChange(InitialSelectionEvent())
+    
+    def TypeChange(self, event):
+        i = event.GetSelection()
+        ep = endpoints[i]
+        self.devBox.Enable(ep.hasDevice)
+        self.imageFileBox.Enable(ep.hasImageFile)
+
 class MainWindow(wx.Frame):
     def __init__(self,parent,id,title):
         wx.Frame.__init__(self,parent,id,title)
@@ -344,8 +378,6 @@ class MainWindow(wx.Frame):
         self.initialize()
 
     def readPartitions(self):
-        self.devices = list()
-        
         for devname in os.listdir("/sys/block/"):
             # ignore loop and ramdisk devices, not very interesting to us
             if (re.match(r"(loop|ram)\d+", devname)):
@@ -394,7 +426,7 @@ class MainWindow(wx.Frame):
                     # empty partition table entry
                     continue
                     
-                self.devices.append(Device(found.group(1),
+                devices.append(Device(found.group(1),
                     int(found.group(3)) * 512,
                     int(found.group(4)), found.group(5)))
             
@@ -415,21 +447,7 @@ class MainWindow(wx.Frame):
         return choiceControl
         
     def addSourceOrDestOptions(self, column, isDestination):
-        typeBox = self.addChoiceControl('Type',
-            [ep.name for ep in endpoints], (1, column))
-        
-        devBox = self.addChoiceControl('Device',
-            [dev.humanLabel() for dev in self.devices],
-            (2, column))
-
-        if isDestination:
-            flpStyle = wx.FLP_OPEN | wx.FLP_OVERWRITE_PROMPT
-        else:
-            flpStyle = wx.FLP_OPEN | wx.FLP_FILE_MUST_EXIST
-        
-        imageFileBox = self.addWithLabel('Image File',
-            wx.FilePickerCtrl(self, wildcard="Image files (*.img)|*.img",
-                style=flpStyle), (3, column))
+        EndpointSetter(self, column, isDestination)
 
     def initialize(self):
         self.colSizer = wx.BoxSizer(orient=wx.VERTICAL)
