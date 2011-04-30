@@ -245,6 +245,97 @@ class Device(object):
         return "%s (%s, %s)" % (self.name, self.desc,
             self.humanSize())
 
+class Endpoint:
+    @property
+    def name(self):
+        return self._name
+    
+    @property
+    def hasDevice(self):
+        return false
+            
+    @property
+    def hasImageFile(self):
+        return false
+
+    @property
+    def hasServerName(self):
+        return false
+
+    @property
+    def hasServerUser(self):
+        return false
+
+    @property
+    def hasServerPassword(self):
+        return false
+
+    @property
+    def hasShareShare(self):
+        return false
+
+    @property
+    def hasServerPath(self):
+        return false
+
+class LocalDevice(Endpoint):
+    @property
+    def name(self):
+        return "Local disk or partition"
+
+    @property
+    def hasDevice(self):
+        return true
+
+class ImageFile(Endpoint):
+    @property
+    def name(self):
+        return "Image file"
+
+    @property
+    def hasImageFile(self):
+        return true
+
+class GenericServer(Endpoint):
+    @property
+    def hasServerName(self):
+        return true
+
+    @property
+    def hasServerUser(self):
+        return true
+
+    @property
+    def hasServerPassword(self):
+        return true
+
+    @property
+    def hasServerPath(self):
+        return true
+
+class FtpServer(GenericServer):
+    @property
+    def name(self):
+        return "FTP server"
+
+class SshServer(GenericServer):
+    @property
+    def name(self):
+        return "SSH server"
+
+class SmbServer(GenericServer):
+    @property
+    def name(self):
+        return "Windows or Samba server"
+
+class MulticastNetwork(Endpoint):
+    @property
+    def name(self):
+        return "Multicast network"
+
+endpoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
+    SmbServer(), MulticastNetwork()]
+
 class MainWindow(wx.Frame):
     def __init__(self,parent,id,title):
         wx.Frame.__init__(self,parent,id,title)
@@ -324,9 +415,8 @@ class MainWindow(wx.Frame):
         return choiceControl
         
     def addSourceOrDestOptions(self, column, isDestination):
-        types = ('Local Disk/Partition', 'Image File', 'FTP Server', 'SSHFS Server',
-            'Windows/Samba Server', 'Multicast Network')
-        typeBox = self.addChoiceControl('Type', types, (1, column))
+        typeBox = self.addChoiceControl('Type',
+            [ep.name for ep in endpoints], (1, column))
         
         devBox = self.addChoiceControl('Device',
             [dev.humanLabel() for dev in self.devices],
