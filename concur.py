@@ -370,6 +370,21 @@ class LocalDevice(Endpoint):
                     return ('%s is busy:\n\n%s is mounted on %s' %
                         (myDevice, mountedDevice, match.group(2)))
         
+        with open("/proc/swaps") as swaps:
+            swaps.readline() # discard header
+            
+            for line in swaps:
+                match = re.match(r'(\S+).*', line)
+                
+                if not match:
+                    raise StandardError('Unknown line format in ' +
+                        '/proc/swaps: %s' % line)
+                
+                mountedDevice = match.group(1)
+                if IsDeviceOverlap(myDevice, mountedDevice):
+                    return ('%s is busy:\n\n%s is an active swap partition' %
+                        (myDevice, mountedDevice))
+                
         return False
 
     def openInput(self):
