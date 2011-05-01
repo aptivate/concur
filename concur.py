@@ -8,7 +8,9 @@ import subprocess
 try:
     import wx
 except ImportError:
-    raise ImportError,"The wxPython module is required to run this program"
+    raise ImportError, "The wxPython module is required to run this program"
+
+from wx.lib.agw.genericmessagedialog import GenericMessageDialog as MessageDialog
 
 # http://www.win.tue.nl/~aeb/partitions/partition_types-1.html
 
@@ -194,13 +196,31 @@ partition_types = {
     0xff: "Xenix Bad Block Table",
 }
 
-class Device(object):
+def human_size(bytes):
+    value = bytes
+    units = "bytes"
+    
+    if value > 2000:
+        value = value / 1000
+        units = "kB"
+        
+    if value > 2000:
+        value = value / 1000
+        units = "MB"
+       
+    if value > 2000:
+        value = value / 1000
+        units = "GB"
+    
+    return "%.1f %s" % (value, units)
+
+class BlockDevice(object):
     def __init__(self, name, size, type=0, desc=None):
         self._name = name
         self._size = size
         self._type = type
         self._desc = desc
-        
+
     @property
     def name(self):
         return self._name
@@ -210,6 +230,29 @@ class Device(object):
         return self._size
 
     @property
+    def humanSize(self):
+        return human_size(self._size)
+
+    @property
+    def nodeName(self):
+        return "/dev/%s" % self.name
+
+    @property
+    def conciseString(self):
+        return self.deviceName
+
+class Disk(BlockDevice):
+    @property
+    def humanLabel(self):
+        return "%s (Disk, %s)" % (self.name, self.humanSize)
+
+class Partition(BlockDevice):
+    def __init__(self, name, size, type=0, desc=None):
+        BlockDevice.__init__(self, name, size)
+        self._type = type
+        self._desc = desc
+
+    @property
     def type(self):
         return self._type
 
@@ -217,25 +260,6 @@ class Device(object):
     def desc(self):
         return self._desc
     
-    @property
-    def humanSize(self):
-        value = self._size
-        units = "bytes"
-        
-        if value > 2000:
-            value = value / 1000
-            units = "kB"
-            
-        if value > 2000:
-            value = value / 1000
-            units = "MB"
-           
-        if value > 2000:
-            value = value / 1000
-            units = "GB"
-        
-        return "%.1f %s" % (value, units)
-        
     @property
     def typeString(self):
         if self.type in partition_types:
@@ -249,8 +273,12 @@ class Device(object):
             self.humanSize)
 
     @property
-    def conciseString(self):
+    def nodeName(self):
         return "/dev/%s" % self.name
+
+    @property
+    def conciseString(self):
+        return self.deviceName
 
 class Endpoint(object):
     @property
@@ -285,7 +313,26 @@ class Endpoint(object):
     def hasServerPath(self):
         return False
 
+    # override to return true if the device node is mounted
+    @property
+    def inUse(self):
+        return False
+
+    # override to return True if the other endpoint cannot be written to
+    # without corrupting this one, or vice versa
+    def overlaps(self, other):
+        return True
+
+def IsDeviceOverlap(device1, device2):
+    common_len = min(len(device1), len(device2))
+    device1 = device1[:common_len]
+    device2 = device2[:common_len]
+    return device1 == device2
+
 class LocalDevice(Endpoint):
+    def __init__(self, device=None):
+        self._device = device
+    
     @property
     def name(self):
         return "Local disk or partition"
@@ -305,6 +352,35 @@ class LocalDevice(Endpoint):
     @property
     def description(self):
         return self._device.conciseString
+    
+    @property
+    def inUse(self):
+        myDevice = self._device.nodeName
+        
+        with open("/etc/mtab") as mtab:
+            for line in mtab:
+                match = re.match(r'(\S+) (\S+) .*', line)
+                
+                if not match:
+                    raise StandardError('Unknown line format in ' +
+                        '/etc/mtab: %s' % line)
+                
+                mountedDevice = match.group(1)
+                if IsDeviceOverlap(myDevice, mountedDevice):
+                    return ('%s is busy:\n\n%s is mounted on %s' %
+                        (myDevice, mountedDevice, match.group(2)))
+        
+        return False
+
+    def openInput(self):
+        return open(self._device.nodeName, "r")
+
+    def openOutput(self):
+        return open(self._device.nodeName, "w")
+    
+    def overlaps(self, other):
+        return other.hasDevice and IsDeviceOverlap(self.device.nodeName,
+            other.device.nodeName)
 
 class ImageFile(Endpoint):
     @property
@@ -376,16 +452,14 @@ class InitialSelectionEvent(wx.PyCommandEvent):
     def GetSelection(self):
         return 0
 
-class EndpointSetter:
+class EndpointSetter(object):
     def __init__(self, frame, items, column, isDestination):
         self.endpoints = items
         
         self.typeBox = frame.addChoiceControl('Type',
             [ep.name for ep in items], (1, column))
         
-        self.devBox = frame.addChoiceControl('Device',
-            [dev.humanLabel for dev in devices],
-            (2, column))
+        self.devBox = frame.addChoiceControl('Device', [], (2, column))
 
         if isDestination:
             flpStyle = wx.FLP_SAVE | wx.FLP_OVERWRITE_PROMPT
@@ -397,32 +471,53 @@ class EndpointSetter:
                 wildcard="Image files (*.img)|*.img|All files|*",
                 style=flpStyle), (3, column))
                 
-        frame.Bind(wx.EVT_CHOICE, self.OnTypeChange, self.typeBox)
+        self.typeBox.Bind(wx.EVT_CHOICE, self.OnTypeChange)
         self.OnTypeChange()
 
-        frame.Bind(wx.EVT_CHOICE, self.OnDeviceChange, self.devBox)
-        if self.endpoint.hasDevice:
-            self.OnDeviceChange()
+        self.devBox.Bind(wx.EVT_CHOICE, self.OnDeviceChange)
+        self.Refresh()
 
-        frame.Bind(wx.EVT_FILEPICKER_CHANGED, self.OnImageFileChange,
-            self.imageFileBox)
+        self.imageFileBox.Bind(wx.EVT_FILEPICKER_CHANGED,
+            self.OnImageFileChange)
         if self.endpoint.hasImageFile:
             self.OnImageFileChange()
     
-    def OnTypeChange(self):
+    def OnTypeChange(self, event=None):
         self.endpoint = self.endpoints[self.typeBox.Selection]
         self.devBox.Enable(self.endpoint.hasDevice)
         self.imageFileBox.Enable(self.endpoint.hasImageFile)
 
-    def OnDeviceChange(self):
-        self.endpoint.device = devices[self.devBox.Selection]
+    def OnDeviceChange(self, event=None):
+        if self.devBox.Selection >= 0:
+            self.endpoint.device = devices[self.devBox.Selection]
 
-    def OnImageFileChange(self):
+    def OnImageFileChange(self, event=None):
         self.endpoint.imageFile = self.imageFileBox.Path
         
     @property
     def description(self):
         return self.endpoint.description
+        
+    @property
+    def inUse(self):
+        return self.endpoint.inUse
+        
+    def Refresh(self):
+        oldLabel = self.devBox.StringSelection
+        self.devBox.Items = [dev.humanLabel for dev in devices]
+        found = False
+
+        for i, label in enumerate(self.devBox.Items):
+            if label == oldLabel:
+                self.devBox.Selection = i
+                found = True
+                break
+        
+        if not found:
+            self.devBox.Selection = 0
+        
+        if self.endpoint.hasDevice:
+            self.OnDeviceChange()
 
 class MainWindow(wx.Frame):
     def __init__(self,parent,id,title):
@@ -432,10 +527,19 @@ class MainWindow(wx.Frame):
         self.initialize()
 
     def readPartitions(self):
-        for devname in os.listdir("/sys/block/"):
+        global devices
+        devices = list()
+        sys_block = "/sys/block/"
+        
+        for devname in os.listdir(sys_block):
             # ignore loop and ramdisk devices, not very interesting to us
             if (re.match(r"(loop|ram)\d+", devname)):
                 continue
+            
+            with open("%s/%s/size" % (sys_block, devname)) as size_file:
+                disk_size = int(size_file.readline()) * 512
+                
+            devices.append(Disk(devname, disk_size))
             
             sfdisk = subprocess.Popen(['sfdisk', '-l', '-uS', '/dev/' + devname],
                 stdout = subprocess.PIPE, stderr = subprocess.PIPE)
@@ -470,24 +574,24 @@ class MainWindow(wx.Frame):
             for line in sfout.readlines():
                 # /dev/sda1   *      2048 607444991  607442944  83  Linux
                 found = re.match('/dev/(' + devname + r'\d+)' +
-                    r'\s+(\*)?\s+\d+\s+\S+\s+(\d+)\s+(\d+)\s+(.+)', line)
+                    r'\s+(\*)?\s+\d+\s+\S+\s+(\d+)\s+(\S+)\s+(.+)', line)
                 
                 if not found:
                     raise StandardError('Unknown line format from ' +
-                        'sfdisk: ' + line)
+                        'sfdisk for %s: %s' % (devname, line))
                 
                 if found.group(4) == '0':
                     # empty partition table entry
                     continue
                     
-                devices.append(Device(found.group(1),
+                devices.append(Partition(found.group(1),
                     int(found.group(3)) * 512,
-                    int(found.group(4)), found.group(5)))
+                    int(found.group(4), 16), found.group(5)))
             
             returnCode = sfdisk.wait()
             if returnCode != 0:
                 raise StandardError('sfdisk returned %d' % returnCode)
-        
+                
     def addWithLabel(self, label, control, position):
         self.gridSizer.Add(wx.StaticText(self, label=label), position,
             flag=wx.ALIGN_CENTER_VERTICAL)
@@ -549,19 +653,78 @@ class MainWindow(wx.Frame):
         self.buttonSizer = wx.StdDialogButtonSizer()
         self.colSizer.AddF(self.buttonSizer, colFlags.Proportion(0))
         
-        self.startButton = wx.Button(self, id=wx.ID_OK)
+        self.startButton = wx.lib.buttons.ThemedGenBitmapTextButton(self,
+            id=wx.ID_OK, label="Copy",
+            bitmap=wx.ArtProvider.GetBitmap(wx.ART_COPY, wx.ART_BUTTON))
         self.buttonSizer.Add(self.startButton)
-        self.buttonSizer.SetAffirmativeButton(self.startButton)
-        self.Bind(wx.EVT_BUTTON, self.OnStartCopy, self.startButton)
+        # self.buttonSizer.SetAffirmativeButton(self.startButton)
+        self.startButton.Bind(wx.EVT_BUTTON, self.OnStartCopy)
+
+        self.refreshButton = wx.Button(self, id=wx.ID_REFRESH)
+        self.buttonSizer.Add(self.refreshButton)
+        self.refreshButton.Bind(wx.EVT_BUTTON, self.OnRefresh)
         
         self.SetSizerAndFit(self.colSizer)
+        self.OnRefresh()
         self.Show(True)
+        
+    def ShowMessage(self, msg, title, style):
+        dlg = wx.lib.agw.genericmessagedialog.GenericMessageDialog(self,
+            msg, "Concur: %s" % title, style)
+        result = dlg.ShowModal()
+        print "result = %s" % result
+        dlg.Destroy()
+        return result
+        
+    def OnRefresh(self, event=None):
+        self.readPartitions()
+        self.source.Refresh()
+        self.dest.Refresh()
    
     def OnStartCopy(self, event):
+        if (self.source.endpoint.overlaps(self.dest.endpoint)):
+            self.ShowMessage("The source and destination overlap.\n" +
+                "It is forbidden to destroy the source copy by " +
+                "overwriting it.",
+                "Error: Source and destination overlap",
+                wx.ICON_ERROR | wx.OK)
+            return
+        
+        sourceBusy = self.source.inUse
+        if sourceBusy:
+            if self.ShowMessage(("%s.\n\nYour copy may be corrupted by " +
+                "filesystem activity.\nDo you want to copy anyway?") %
+                sourceBusy, "Warning: Source device is in use",
+                wx.ICON_WARNING | wx.YES_NO) != wx.ID_YES:
+                return
+
+        destBusy = self.dest.inUse
+        if destBusy:
+            self.ShowMessage(("%s.\n\nOverwriting a mounted filesystem " +
+                "is forbidden\nto prevent operating system crashes and\n" +
+                "potential serious data loss.") % destBusy,
+                "Error: Destination device is in use",
+                wx.ICON_ERROR | wx.OK)
+            return
+
+        sda = Disk("sda", 0)
+        if self.dest.endpoint.overlaps(LocalDevice(sda)):
+            self.ShowMessage("It is forbidden to overwrite /dev/sda\n" +
+                "to prevent major accidental data loss.",
+                "Error: Destination device is /dev/sda",
+                wx.ICON_ERROR | wx.OK)
+            return
+
         prog = wx.ProgressDialog("Copying",
             "Copying from %s to %s" % (self.source.description,
                 self.dest.description),
             parent=self, style=wx.PD_CAN_ABORT | wx.PD_ESTIMATED_TIME)
+        self.source.prepareSource()
+        self.dest.prepareDest()
+        self.Bind(wx.EVT_IDLE, self.OnIdleBackgroundCopy)
+    
+    def OnIdleBackgroundCopy(self, event):
+        pass
 
 if __name__ == "__main__":
     app = wx.App()
