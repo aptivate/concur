@@ -4,6 +4,7 @@
 import re
 import os
 import subprocess
+import fcntl
 
 try:
     import wx
@@ -215,11 +216,9 @@ def human_size(bytes):
     return "%.1f %s" % (value, units)
 
 class BlockDevice(object):
-    def __init__(self, name, size, type=0, desc=None):
+    def __init__(self, name, size):
         self._name = name
         self._size = size
-        self._type = type
-        self._desc = desc
 
     @property
     def name(self):
@@ -239,7 +238,7 @@ class BlockDevice(object):
 
     @property
     def conciseString(self):
-        return self.deviceName
+        return self.nodeName
 
 class Disk(BlockDevice):
     @property
@@ -321,8 +320,20 @@ class Endpoint(object):
     # override to return True if the other endpoint cannot be written to
     # without corrupting this one, or vice versa
     def overlaps(self, other):
-        return True
+        if self.hasDevice:
+            myDevice = self.device.nodeName
+        elif self.hasImageFile:
+            myDevice = self.imageFileDevice
+        else:
+            return False # we don't need a device, so can't conflict
 
+        if other.hasDevice:
+            return IsDeviceOverlap(myDevice, other.device.nodeName)
+        elif other.hasImageFile:
+            return IsDeviceOverlap(myDevice, other.imageFileDevice)
+        else:
+            return False # other doesn't need a device, so can't conflict
+        
 def IsDeviceOverlap(device1, device2):
     common_len = min(len(device1), len(device2))
     device1 = device1[:common_len]
@@ -388,14 +399,34 @@ class LocalDevice(Endpoint):
         return False
 
     def openInput(self):
-        return open(self._device.nodeName, "r")
+        handle = open(self._device.nodeName, "rb")
+        fcntl.lockf(handle, fcntl.LOCK_SH)
+        return handle
 
     def openOutput(self):
-        return open(self._device.nodeName, "w")
+        handle = open(self._device.nodeName, "wb")
+        fcntl.lockf(handle, fcntl.LOCK_EX)
+        return handle
     
     def overlaps(self, other):
-        return other.hasDevice and IsDeviceOverlap(self.device.nodeName,
-            other.device.nodeName)
+        if other.hasDevice:
+            return IsDeviceOverlap(self.device.nodeName,
+                other.device.nodeName)
+        elif other.hasImageFile:
+            return IsDeviceOverlap(self.device.nodeName,
+                other.imageFileDevice)
+    
+    @property
+    def size(self):
+        return self._device.size
+
+class BitBucket(LocalDevice):
+    def __init__(self):
+        LocalDevice.__init__(self, BlockDevice("/dev/zero", None))
+
+    @property
+    def name(self):
+        return "Bit bucket (discard/zero)"
 
 class ImageFile(Endpoint):
     @property
@@ -416,7 +447,47 @@ class ImageFile(Endpoint):
 
     @property    
     def description(self):
-        return self._imageFile
+        return self._imageFile 
+        
+    @property
+    def inUse(self):
+        # openInput or openOutput will fail if the file is in use and
+        # sharing the lock is not appropriate, so just return False here.
+        return False
+
+    def openInput(self):
+        handle = open(self._imageFile, "rb")
+        fcntl.lockf(handle, fcntl.LOCK_SH)
+        return handle
+
+    def openOutput(self):
+        handle = open(self._imageFile, "wb")
+        fcntl.lockf(handle, fcntl.LOCK_EX)
+        return handle
+        
+    @property
+    def imageFileDevice(self):
+        foundDevice = None
+        foundMount = None
+        
+        with open("/etc/mtab") as mtab:
+            for line in mtab:
+                match = re.match(r'(\S+) (\S+) .*', line)
+                
+                if not match:
+                    raise StandardError('Unknown line format in ' +
+                        '/etc/mtab: %s' % line)
+                
+                thisDevice = match.group(1)
+                thisMount = match.group(2)
+                
+                # find the most specific (longest) matching mount
+                if IsDeviceOverlap(thisMount, self._imageFile):
+                    if foundMount is None or len(thisMount) > len(foundMount):
+                        foundDevice = thisDevice
+                        foundMount = thisMount
+
+        return foundDevice        
 
 class GenericServer(Endpoint):
     @property
@@ -456,10 +527,10 @@ class MulticastNetwork(Endpoint):
         return "Multicast network"
 
 sourcePoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
-    SmbServer(), MulticastNetwork()]
+    SmbServer(), MulticastNetwork(), BitBucket()]
 
 destPoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
-    SmbServer(), MulticastNetwork()]
+    SmbServer(), MulticastNetwork(), BitBucket()]
 
 devices = list()
 
@@ -477,7 +548,8 @@ class EndpointSetter(object):
         self.devBox = frame.addChoiceControl('Device', [], (2, column))
 
         if isDestination:
-            flpStyle = wx.FLP_SAVE | wx.FLP_OVERWRITE_PROMPT
+            flpStyle = (wx.FLP_SAVE | wx.FLP_OVERWRITE_PROMPT |
+                wx.PB_USE_TEXTCTRL)
         else:
             flpStyle = wx.FLP_OPEN | wx.FLP_FILE_MUST_EXIST
         
@@ -508,6 +580,10 @@ class EndpointSetter(object):
 
     def OnImageFileChange(self, event=None):
         self.endpoint.imageFile = self.imageFileBox.Path
+
+    @property
+    def size(self):
+        return self.endpoint.size
         
     @property
     def description(self):
@@ -533,6 +609,12 @@ class EndpointSetter(object):
         
         if self.endpoint.hasDevice:
             self.OnDeviceChange()
+
+    def openInput(self):
+        return self.endpoint.openInput()
+
+    def openOutput(self):
+        return self.endpoint.openOutput()
 
 class MainWindow(wx.Frame):
     def __init__(self,parent,id,title):
@@ -630,7 +712,7 @@ class MainWindow(wx.Frame):
         self.presetList = wx.Choice(self, choices=('Clone disk to disk',
             'Backup disk to network', 'Restore disk from network',
             'Backup partition to network', 'Restore partition from network',
-            'Wipe disk'))
+            'Wipe disk', 'Read test', 'Compare contents'))
         self.colSizer.AddF(self.presetList, colFlags)
         colFlags.Border(wx.BOTTOM | wx.LEFT | wx.RIGHT, borderWidth * 2)
         
@@ -648,7 +730,8 @@ class MainWindow(wx.Frame):
         self.dest = self.addSourceOrDestOptions(destPoints, 4, True)
 
         method_choices = ('Raw copy', 'Smart partition copy',
-            'MBR copy', 'Rescue copy')
+            'MBR copy', 'Rescue copy', 'Read only', 'Checksum',
+            'Compare contents')
 
         self.methodList = self.addChoiceControl('Method',
             method_choices, (1,2))
@@ -687,7 +770,7 @@ class MainWindow(wx.Frame):
         dlg = wx.lib.agw.genericmessagedialog.GenericMessageDialog(self,
             msg, "Concur: %s" % title, style)
         result = dlg.ShowModal()
-        print "result = %s" % result
+        # print "result = %s" % result
         dlg.Destroy()
         return result
         
@@ -730,16 +813,30 @@ class MainWindow(wx.Frame):
                 wx.ICON_ERROR | wx.OK)
             return
 
-        prog = wx.ProgressDialog("Copying",
+        self.input = self.source.openInput()
+        self.output = self.dest.openOutput()
+        self.position = 0
+        self.length = self.source.size
+        if self.length is None:
+            self.length = self.dest.size
+
+        self.progress = wx.ProgressDialog("Copying",
             "Copying from %s to %s" % (self.source.description,
                 self.dest.description),
             parent=self, style=wx.PD_CAN_ABORT | wx.PD_ESTIMATED_TIME)
-        self.source.prepareSource()
-        self.dest.prepareDest()
+        
         self.Bind(wx.EVT_IDLE, self.OnIdleBackgroundCopy)
     
     def OnIdleBackgroundCopy(self, event):
-        pass
+        bufsize = 128*1024
+        buffer = self.input.read(bufsize)
+        eof = (len(buffer) < bufsize)
+        self.output.write(buffer)
+        self.position += len(buffer)
+        progress = (self.position * 100) / self.length
+        (cont, skip) = self.progress.Update(progress)
+        if not eof:
+            event.RequestMore()
 
 if __name__ == "__main__":
     app = wx.App()
