@@ -277,7 +277,7 @@ class Partition(BlockDevice):
 
     @property
     def conciseString(self):
-        return self.deviceName
+        return self.nodeName
 
 class Endpoint(object):
     @property
@@ -429,6 +429,9 @@ class BitBucket(LocalDevice):
         return "Bit bucket (discard/zero)"
 
 class ImageFile(Endpoint):
+    def __init__(self):
+        self._imageFile = None
+        
     @property
     def name(self):
         return "Image file"
@@ -467,6 +470,9 @@ class ImageFile(Endpoint):
         
     @property
     def imageFileDevice(self):
+        if self._imageFile is None:
+            return None
+            
         foundDevice = None
         foundMount = None
         
@@ -615,6 +621,26 @@ class EndpointSetter(object):
 
     def openOutput(self):
         return self.endpoint.openOutput()
+
+    def _prepareError(self, frame, message):
+        frame.ShowMessage(message, "Error: Required value missing",
+            wx.ICON_ERROR | wx.OK)
+        return False
+    
+    def Prepare(self, frame, whichEnd):
+        ep = self.endpoint
+        
+        if ep.hasDevice:
+            if ep.device is None:
+                return self._prepareError(frame,
+                    "Please specify the %s device node" % whichEnd)
+        
+        if ep.hasImageFile:
+            if ep.imageFile is None:
+                return self._prepareError(frame,
+                    "Please specify the %s image file name" % whichEnd)
+        
+        return True 
 
 class MainWindow(wx.Frame):
     def __init__(self,parent,id,title):
@@ -780,6 +806,9 @@ class MainWindow(wx.Frame):
         self.dest.Refresh()
    
     def OnStartCopy(self, event):
+        self.source.Prepare(self, "source")
+        self.dest.Prepare(self, "destination")
+
         if (self.source.endpoint.overlaps(self.dest.endpoint)):
             self.ShowMessage("The source and destination overlap.\n" +
                 "It is forbidden to destroy the source copy by " +
@@ -823,7 +852,7 @@ class MainWindow(wx.Frame):
         self.progress = wx.ProgressDialog("Copying",
             "Copying from %s to %s" % (self.source.description,
                 self.dest.description),
-            parent=self, style=wx.PD_CAN_ABORT | wx.PD_ESTIMATED_TIME)
+            parent=self, style=wx.PD_CAN_ABORT | wx.PD_REMAINING_TIME)
         
         self.Bind(wx.EVT_IDLE, self.OnIdleBackgroundCopy)
     
@@ -837,6 +866,7 @@ class MainWindow(wx.Frame):
         (cont, skip) = self.progress.Update(progress)
         if not eof:
             event.RequestMore()
+        wx.SafeYield(self.progress)
 
 if __name__ == "__main__":
     app = wx.App()
