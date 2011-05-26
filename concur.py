@@ -1,10 +1,14 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-import re
-import os
-import subprocess
 import fcntl
+import lzo
+import os
+import optparse
+import re
+import stat
+import subprocess
+import sys
 
 try:
     import wx
@@ -233,17 +237,22 @@ class BlockDevice(object):
         return human_size(self._size)
 
     @property
-    def nodeName(self):
+    def NodeName(self):
         return "/dev/%s" % self.name
 
     @property
     def conciseString(self):
-        return self.nodeName
+        return self.NodeName
 
 class Disk(BlockDevice):
     @property
-    def humanLabel(self):
+    def HumanLabel(self):
         return "%s (Disk, %s)" % (self.name, self.humanSize)
+
+class PermissionDeniedDisk(Disk):
+    @property
+    def HumanLabel(self):
+        return "%s (permission denied, %s)" % (self.name, self.humanSize)
 
 class Partition(BlockDevice):
     def __init__(self, name, size, type=0, desc=None):
@@ -260,24 +269,14 @@ class Partition(BlockDevice):
         return self._desc
     
     @property
-    def typeString(self):
-        if self.type in partition_types:
-            return partition_types[self.type]
-        else:
-            return "Unknown type %02x" % self.type
-            
-    @property
-    def humanLabel(self):
+    def HumanLabel(self):
         return "%s (%s, %s)" % (self.name, self.desc,
             self.humanSize)
 
+class UnknownPartition(BlockDevice):
     @property
-    def nodeName(self):
-        return "/dev/%s" % self.name
-
-    @property
-    def conciseString(self):
-        return self.nodeName
+    def HumanLabel(self):
+        return "%s (unknown type, %s)" % (self.name, self.humanSize)
 
 class Endpoint(object):
     @property
@@ -285,31 +284,31 @@ class Endpoint(object):
         return self._name
     
     @property
-    def hasDevice(self):
+    def HasDevice(self):
         return False
             
     @property
-    def hasImageFile(self):
+    def HasImageFile(self):
         return False
 
     @property
-    def hasServerName(self):
+    def HasServerName(self):
         return False
 
     @property
-    def hasServerUser(self):
+    def HasServerUser(self):
         return False
 
     @property
-    def hasServerPassword(self):
+    def HasServerPassword(self):
         return False
 
     @property
-    def hasShareShare(self):
+    def HasShareShare(self):
         return False
 
     @property
-    def hasServerPath(self):
+    def HasServerPath(self):
         return False
 
     # override to return true if the device node is mounted
@@ -320,19 +319,35 @@ class Endpoint(object):
     # override to return True if the other endpoint cannot be written to
     # without corrupting this one, or vice versa
     def overlaps(self, other):
-        if self.hasDevice:
-            myDevice = self.device.nodeName
-        elif self.hasImageFile:
+        if self.HasDevice:
+            myDevice = self.DeviceNode.NodeName
+        elif self.HasImageFile:
             myDevice = self.imageFileDevice
         else:
             return False # we don't need a device, so can't conflict
 
-        if other.hasDevice:
-            return IsDeviceOverlap(myDevice, other.device.nodeName)
-        elif other.hasImageFile:
+        if other.HasDevice:
+            return IsDeviceOverlap(myDevice, other.DeviceNode.NodeName)
+        elif other.HasImageFile:
             return IsDeviceOverlap(myDevice, other.imageFileDevice)
         else:
             return False # other doesn't need a device, so can't conflict
+    
+    def _SetInput(self, handle):
+        self._isOutput = False
+        fcntl.lockf(handle, fcntl.LOCK_SH)
+    
+    def _SetOutput(self, handle):
+        self._isOutput = True
+        fcntl.lockf(handle, fcntl.LOCK_EX)
+    
+    @property
+    def IsOutput(self):
+        return self._isOutput
+    
+    def Cancel(self):
+        # nothing to do by default, but some subclasses override this
+        pass
         
 def IsDeviceOverlap(device1, device2):
     common_len = min(len(device1), len(device2))
@@ -343,30 +358,30 @@ def IsDeviceOverlap(device1, device2):
 class LocalDevice(Endpoint):
     def __init__(self, device=None):
         self._device = device
-    
+
     @property
     def name(self):
         return "Local disk or partition"
 
     @property
-    def hasDevice(self):
+    def HasDevice(self):
         return True
-    
+
     @property
-    def device(self):
+    def DeviceNode(self):
         return self._device
         
-    @device.setter
-    def device(self, device):
+    @DeviceNode.setter
+    def DeviceNode(self, device):
         self._device = device
 
     @property
     def description(self):
         return self._device.conciseString
-    
+
     @property
     def inUse(self):
-        myDevice = self._device.nodeName
+        myDevice = self._device.NodeName
         
         with open("/etc/mtab") as mtab:
             for line in mtab:
@@ -398,27 +413,32 @@ class LocalDevice(Endpoint):
                 
         return False
 
-    def openInput(self):
-        handle = open(self._device.nodeName, "rb")
-        fcntl.lockf(handle, fcntl.LOCK_SH)
+    def OpenInput(self):
+        handle = open(self._device.NodeName, "rb")
+        self._SetInput(handle)
         return handle
+        # caller must close handle when done
 
-    def openOutput(self):
-        handle = open(self._device.nodeName, "wb")
-        fcntl.lockf(handle, fcntl.LOCK_EX)
+    def OpenOutput(self):
+        handle = open(self._device.NodeName, "wb")
+        self._SetOutput(handle)
         return handle
-    
+        # caller must close handle when done
+
     def overlaps(self, other):
-        if other.hasDevice:
-            return IsDeviceOverlap(self.device.nodeName,
-                other.device.nodeName)
-        elif other.hasImageFile:
-            return IsDeviceOverlap(self.device.nodeName,
+        if other.HasDevice:
+            return IsDeviceOverlap(self.DeviceNode.NodeName,
+                other.DeviceNode.NodeName)
+        elif other.HasImageFile:
+            return IsDeviceOverlap(self.DeviceNode.NodeName,
                 other.imageFileDevice)
-    
+        
     @property
     def size(self):
         return self._device.size
+
+    def Recognises(self, name, exists, statinfo):
+        return exists and stat.S_ISBLK(statinfo.st_mode)
 
 class BitBucket(LocalDevice):
     def __init__(self):
@@ -427,6 +447,9 @@ class BitBucket(LocalDevice):
     @property
     def name(self):
         return "Bit bucket (discard/zero)"
+
+    def Recognises(self, name, exists, statinfo):
+        return name == "/dev/null" or name == "bitbucket"
 
 class ImageFile(Endpoint):
     def __init__(self):
@@ -437,7 +460,7 @@ class ImageFile(Endpoint):
         return "Image file"
 
     @property
-    def hasImageFile(self):
+    def HasImageFile(self):
         return True
 
     @property
@@ -458,15 +481,17 @@ class ImageFile(Endpoint):
         # sharing the lock is not appropriate, so just return False here.
         return False
 
-    def openInput(self):
+    def OpenInput(self):
         handle = open(self._imageFile, "rb")
-        fcntl.lockf(handle, fcntl.LOCK_SH)
+        Endpoint._SetInput(self, handle)
         return handle
+        # caller must free handle when done
 
-    def openOutput(self):
+    def OpenOutput(self):
         handle = open(self._imageFile, "wb")
-        fcntl.lockf(handle, fcntl.LOCK_EX)
+        Endpoint._SetOutput(self, handle)
         return handle
+        # caller must free handle when done
         
     @property
     def imageFileDevice(self):
@@ -488,28 +513,37 @@ class ImageFile(Endpoint):
                 thisMount = match.group(2)
                 
                 # find the most specific (longest) matching mount
+                # print "test for overlap: %s and %s" % (thisMount, self._imageFile)
                 if IsDeviceOverlap(thisMount, self._imageFile):
                     if foundMount is None or len(thisMount) > len(foundMount):
                         foundDevice = thisDevice
                         foundMount = thisMount
 
-        return foundDevice        
+        return foundDevice
+    
+    def Cancel(self):
+        # override to remove the destination file if the copy is cancelled
+        if self.IsOutput:
+            os.unlink(self._imageFile)
+
+    def Recognises(self, name, exists, statinfo):
+        return not exists or stat.S_ISREG(statinfo.st_mode)
 
 class GenericServer(Endpoint):
     @property
-    def hasServerName(self):
+    def HasServerName(self):
         return True
 
     @property
-    def hasServerUser(self):
+    def HasServerUser(self):
         return True
 
     @property
-    def hasServerPassword(self):
+    def HasServerPassword(self):
         return True
 
     @property
-    def hasServerPath(self):
+    def HasServerPath(self):
         return True
 
 class FtpServer(GenericServer):
@@ -517,20 +551,32 @@ class FtpServer(GenericServer):
     def name(self):
         return "FTP server"
 
+    def Recognises(self, name, exists, statinfo):
+        return name.startswith('ftp:')
+
 class SshServer(GenericServer):
     @property
     def name(self):
         return "SSH server"
+
+    def Recognises(self, name, exists, statinfo):
+        return name.startswith('ssh:')
 
 class SmbServer(GenericServer):
     @property
     def name(self):
         return "Windows or Samba server"
 
+    def Recognises(self, name, exists, statinfo):
+        return name.startswith('smb:')
+
 class MulticastNetwork(Endpoint):
     @property
     def name(self):
         return "Multicast network"
+
+    def Recognises(self, name, exists, statinfo):
+        return name.startswith('multicast:')
 
 sourcePoints = [LocalDevice(), ImageFile(), FtpServer(), SshServer(),
     SmbServer(), MulticastNetwork(), BitBucket()]
@@ -544,7 +590,7 @@ class InitialSelectionEvent(wx.PyCommandEvent):
     def GetSelection(self):
         return 0
 
-class EndpointSetter(object):
+class EndpointUserInterface(object):
     def __init__(self, frame, items, column, isDestination):
         self.endpoints = items
         
@@ -572,19 +618,20 @@ class EndpointSetter(object):
 
         self.imageFileBox.Bind(wx.EVT_FILEPICKER_CHANGED,
             self.OnImageFileChange)
-        if self.endpoint.hasImageFile:
+        if self.endpoint.HasImageFile:
             self.OnImageFileChange()
     
     def OnTypeChange(self, event=None):
         self.endpoint = self.endpoints[self.typeBox.Selection]
-        self.devBox.Enable(self.endpoint.hasDevice)
-        self.imageFileBox.Enable(self.endpoint.hasImageFile)
+        self.devBox.Enable(self.endpoint.HasDevice)
+        self.imageFileBox.Enable(self.endpoint.HasImageFile)
 
     def OnDeviceChange(self, event=None):
         if self.devBox.Selection >= 0:
-            self.endpoint.device = devices[self.devBox.Selection]
+            self.endpoint.DeviceNode = devices[self.devBox.Selection]
 
     def OnImageFileChange(self, event=None):
+        self.imageFileBox.Path = os.path.abspath(self.imageFileBox.Path)
         self.endpoint.imageFile = self.imageFileBox.Path
 
     @property
@@ -601,7 +648,7 @@ class EndpointSetter(object):
         
     def Refresh(self):
         oldLabel = self.devBox.StringSelection
-        self.devBox.Items = [dev.humanLabel for dev in devices]
+        self.devBox.Items = [dev.HumanLabel for dev in devices]
         found = False
 
         for i, label in enumerate(self.devBox.Items):
@@ -613,14 +660,14 @@ class EndpointSetter(object):
         if not found:
             self.devBox.Selection = 0
         
-        if self.endpoint.hasDevice:
+        if self.endpoint.HasDevice:
             self.OnDeviceChange()
 
-    def openInput(self):
-        return self.endpoint.openInput()
+    def OpenInput(self):
+        return self.endpoint.OpenInput()
 
-    def openOutput(self):
-        return self.endpoint.openOutput()
+    def OpenOutput(self):
+        return self.endpoint.OpenOutput()
 
     def _prepareError(self, frame, message):
         frame.ShowMessage(message, "Error: Required value missing",
@@ -630,22 +677,71 @@ class EndpointSetter(object):
     def Prepare(self, frame, whichEnd):
         ep = self.endpoint
         
-        if ep.hasDevice:
-            if ep.device is None:
+        if ep.HasDevice:
+            if ep.DeviceNode is None:
                 return self._prepareError(frame,
                     "Please specify the %s device node" % whichEnd)
         
-        if ep.hasImageFile:
+        if ep.HasImageFile:
             if ep.imageFile is None:
                 return self._prepareError(frame,
                     "Please specify the %s image file name" % whichEnd)
-        
-        return True 
 
+            if ep.imageFileDevice is None:
+                return self._prepareError(frame,
+                    "Cannot identify mount device for image file %s" %
+                        ep.imageFile)
+        
+        return True
+    
+    def Cancel(self):
+        self.endpoint.Cancel()
+        
+    def SetByName(self, frame, descString):
+        try:
+            statinfo = os.stat(descString)
+            exists = True
+        except OSError as e:
+            statinfo = None
+            exists = False
+        
+        foundEndpointIndex = None
+        
+        # hope there isn't more than one match in the list!
+        for i, ep in enumerate(self.endpoints):
+            if ep.Recognises(descString, exists, statinfo):
+                foundEndpointIndex = i
+        
+        if foundEndpointIndex is None:
+            return self._prepareError(frame,
+                "%s does not recognize target %s" % (self, descString))
+        
+        self.typeBox.Selection = foundEndpointIndex
+        self.OnTypeChange()
+        
+        if self.endpoint.HasDevice:
+            foundDeviceIndex = None
+            
+            for i, dev in enumerate(devices):
+                devstats = os.stat(dev.NodeName)
+                if devstats.st_rdev == statinfo.st_rdev:
+                    foundDeviceIndex = i
+
+            if foundDeviceIndex is None:
+                return self._prepareError(frame,
+                    "%s is not one of the detected block devices %s" \
+                    % (descString, repr(devices)))
+            
+            self.devBox.Selection = foundDeviceIndex
+            self.OnDeviceChange()
+        
+        if self.endpoint.HasImageFile:
+            self.imageFileBox.Path = os.path.abspath(descString)
+            self.OnImageFileChange()
+        
 class MainWindow(wx.Frame):
-    def __init__(self,parent,id,title):
-        wx.Frame.__init__(self,parent,id,title)
-        self.parent = parent
+    def __init__(self):
+        wx.Frame.__init__(self, None, -1, "Concur")
         self.readPartitions()
         self.initialize()
 
@@ -661,59 +757,84 @@ class MainWindow(wx.Frame):
             
             with open("%s/%s/size" % (sys_block, devname)) as size_file:
                 disk_size = int(size_file.readline()) * 512
-                
-            devices.append(Disk(devname, disk_size))
             
-            sfdisk = subprocess.Popen(['sfdisk', '-l', '-uS', '/dev/' + devname],
-                stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+            devpath = "/dev/%s" % devname
+            
+            sfdisk = subprocess.Popen(['sfdisk', '-l', '-uS', devpath],
+                stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
             
             if not sfdisk:
                 raise StandardError('sfdisk failed' % returnCode)
                 
             sfout = sfdisk.stdout
-            
             line = sfout.readline()
-            if line != '\n':
-                raise StandardError('Unknown output from sfdisk: %s' % line)
-                
-            line = sfout.readline()
-            if not re.match(r'Disk /dev/' + devname + ': .*', line):
-                raise StandardError('Unknown output from sfdisk: %s' % line)
 
-            line = sfout.readline()
-            if not re.match(r'Units = sectors of 512 bytes, counting from 0.*', line):
-                raise StandardError('Unknown output from sfdisk: %s' % line)
-
-            line = sfout.readline()
-            if line != '\n':
-                raise StandardError('Unknown output from sfdisk: %s' % line)
+            if line == ('%s: Permission denied\n' % devpath):
+                devices.append(PermissionDeniedDisk(devname, disk_size))
                 
-            #    Device Boot    Start       End   #sectors  Id  System
-            line = sfout.readline()
-            if not re.match(r'\s+Device\s+Boot\s+Start\s+End\s+#sectors' +
-                '\s+Id\s+System', line):
-                raise StandardError('Unknown output from sfdisk: %s' % line)
-
-            for line in sfout.readlines():
-                # /dev/sda1   *      2048 607444991  607442944  83  Linux
-                found = re.match('/dev/(' + devname + r'\d+)' +
-                    r'\s+(\*)?\s+\d+\s+\S+\s+(\d+)\s+(\S+)\s+(.+)', line)
-                
-                if not found:
-                    raise StandardError('Unknown line format from ' +
-                        'sfdisk for %s: %s' % (devname, line))
-                
-                if found.group(4) == '0':
-                    # empty partition table entry
-                    continue
+                # alternative method, scan /sys/block/sda for subdirs
+                # with partition information, doesn't require permissions
+                for partname in os.listdir('%s/%s' % (sys_block, devname)):
+                    sys_block_disk_part = '%s/%s/%s' % (sys_block,
+                        devname, partname)
                     
-                devices.append(Partition(found.group(1),
-                    int(found.group(3)) * 512,
-                    int(found.group(4), 16), found.group(5)))
+                    if os.access('%s/partition' % sys_block_disk_part, os.F_OK):
+                        with open("%s/size" % sys_block_disk_part) as size_file:
+                            partition_size = int(size_file.readline()) * 512
+                        devices.append(UnknownPartition(partname,
+                            partition_size))
+            else:
+                devices.append(Disk(devname, disk_size))
             
-            returnCode = sfdisk.wait()
-            if returnCode != 0:
-                raise StandardError('sfdisk returned %d' % returnCode)
+                if line != '\n':
+                    raise StandardError('Unknown output from sfdisk (1): %s' % line)
+                    
+                line = sfout.readline()
+                if not re.match(r'Disk /dev/' + devname + ': .*', line):
+                    raise StandardError('Unknown output from sfdisk (2): %s' % line)
+
+                line = sfout.readline()
+                
+                if line == 'Warning: extended partition does not start at a cylinder boundary.\n':
+                    line = sfout.readline()
+                    if line == 'DOS and Linux will interpret the contents differently.\n':
+                        line = sfout.readline()
+                
+                if not re.match(r'Units = sectors of 512 bytes, counting from 0.*', line):
+                    raise StandardError('Unknown output from sfdisk (3): %s' % line)
+
+                line = sfout.readline()
+                if line != '\n':
+                    raise StandardError('Unknown output from sfdisk (4): %s' % line)
+                    
+                #    Device Boot    Start       End   #sectors  Id  System
+                line = sfout.readline()
+                if not re.match(r'\s+Device\s+Boot\s+Start\s+End\s+#sectors' +
+                    '\s+Id\s+System', line):
+                    raise StandardError('Unknown output from sfdisk (5): %s' % line)
+
+                for line in sfout.readlines():
+                    # /dev/sda1   *      2048 607444991  607442944  83  Linux
+                    found = re.match('/dev/(' + devname + r'\d+)' +
+                        r'\s+(\*)?\s+\d+\s+\S+\s+(\d+)\s+(\S+)\s+(.+)', line)
+                    
+                    if not found:
+                        raise StandardError('Unknown line format from ' +
+                            'sfdisk for %s: %s' % (devname, line))
+                    
+                    if found.group(4) == '0':
+                        # empty partition table entry
+                        continue
+                        
+                    devices.append(Partition(found.group(1),
+                        int(found.group(3)) * 512,
+                        int(found.group(4), 16), found.group(5)))
+                
+                returnCode = sfdisk.wait()
+                if returnCode != 0:
+                    raise StandardError('sfdisk returned %d' % returnCode)
+                
+                sfout.close()
                 
     def addWithLabel(self, label, control, position):
         self.gridSizer.Add(wx.StaticText(self, label=label), position,
@@ -728,7 +849,7 @@ class MainWindow(wx.Frame):
         return choiceControl
         
     def addSourceOrDestOptions(self, items, column, isDestination):
-        return EndpointSetter(self, items, column, isDestination)
+        return EndpointUserInterface(self, items, column, isDestination)
 
     def initialize(self):
         self.colSizer = wx.BoxSizer(orient=wx.VERTICAL)
@@ -756,8 +877,9 @@ class MainWindow(wx.Frame):
         self.dest = self.addSourceOrDestOptions(destPoints, 4, True)
 
         method_choices = ('Raw copy', 'Smart partition copy',
-            'MBR copy', 'Rescue copy', 'Read only', 'Checksum',
-            'Compare contents')
+            'MBR copy', 'Rescue copy', 'Read test (read only)', 'Checksum',
+            'Compare contents', 'Multicast entire disk',
+            'Multicast blocks (experimental)')
 
         self.methodList = self.addChoiceControl('Method',
             method_choices, (1,2))
@@ -800,12 +922,25 @@ class MainWindow(wx.Frame):
         dlg.Destroy()
         return result
         
+    def SetSourceByName(self, source):
+        self.source.SetByName(source)
+
+    def SetDestByName(self, dest):
+        self.dest.SetByName(dest)
+        
     def OnRefresh(self, event=None):
         self.readPartitions()
         self.source.Refresh()
         self.dest.Refresh()
+        
+    def Warn(self, message, title):
+        if wx.GetApp()._options.ignore_warnings:
+            return True
+        
+        return self.ShowMessage(message, title,
+            wx.ICON_WARNING | wx.YES_NO) == wx.ID_YES
    
-    def OnStartCopy(self, event):
+    def OnStartCopy(self, event=None):
         self.source.Prepare(self, "source")
         self.dest.Prepare(self, "destination")
 
@@ -819,10 +954,9 @@ class MainWindow(wx.Frame):
         
         sourceBusy = self.source.inUse
         if sourceBusy:
-            if self.ShowMessage(("%s.\n\nYour copy may be corrupted by " +
+            if not self.Warn(("%s.\n\nYour copy may be corrupted by " +
                 "filesystem activity.\nDo you want to copy anyway?") %
-                sourceBusy, "Warning: Source device is in use",
-                wx.ICON_WARNING | wx.YES_NO) != wx.ID_YES:
+                sourceBusy, "Warning: Source device is in use"):
                 return
 
         destBusy = self.dest.inUse
@@ -842,9 +976,10 @@ class MainWindow(wx.Frame):
                 wx.ICON_ERROR | wx.OK)
             return
 
-        self.input = self.source.openInput()
-        self.output = self.dest.openOutput()
+        self.input  = self.source.OpenInput()
+        self.output = self.dest.OpenOutput()
         self.position = 0
+        
         self.length = self.source.size
         if self.length is None:
             self.length = self.dest.size
@@ -862,13 +997,72 @@ class MainWindow(wx.Frame):
         eof = (len(buffer) < bufsize)
         self.output.write(buffer)
         self.position += len(buffer)
-        progress = (self.position * 100) / self.length
-        (cont, skip) = self.progress.Update(progress)
-        if not eof:
+        positionPercent = (self.position * 100) / self.length
+        
+        (cont, skip) = self.progress.Update(positionPercent)
+        if not cont:
+            eof = True
+            self.source.Cancel()
+            self.dest.Cancel()
+            
+        if eof:
+            self.input.close()
+            self.output.close()
+            self.progress.Destroy()
+            self.Unbind(wx.EVT_IDLE, handler=self.OnIdleBackgroundCopy)            
+        else:
             event.RequestMore()
+        
         wx.SafeYield(self.progress)
+        
+        if wx.GetApp()._options.exit_after:
+            wx.Exit()
 
 if __name__ == "__main__":
     app = wx.App()
-    frame = MainWindow(None, -1, 'Concur')
+    frame = MainWindow()
+
+    parser = optparse.OptionParser()
+    parser.add_option('-i', '--ignore-warnings', action="store_true",
+        dest='ignore_warnings',
+        help='Ignore (hide) warnings (e.g. device in use)')
+    parser.add_option('-s', '--start-copy', action="store_true",
+        dest='start_copy',
+        help='Start copying automatically')
+    parser.add_option('-x', '--exit-after', action="store_true",
+        dest='exit_after',
+        help='Exit after copying')
+    (options, files) = parser.parse_args()
+    
+    if len(files) >= 1:
+        frame.source.SetByName(frame, files.pop(0))
+
+    if len(files) >= 1:
+        frame.dest.SetByName(frame, files.pop(0))
+
+    if len(files) >= 1:
+        frame.ShowMessage(
+            ("Unexpected command-line argument(s): %s." % repr(files)),
+            "Error: Invalid command line",
+            wx.ICON_ERROR | wx.OK)
+        # Not safe to start automatically after a command-line error
+        options.start_copy = False
+
+    app._options = options
+    
+    if options.start_copy:
+        frame.OnStartCopy(None)
+    elif options.ignore_warnings:
+        frame.ShowMessage(
+            "Command-line option '--ignore-warnings' requires '--start-copy'",
+            "Error: Invalid command line",
+            wx.ICON_ERROR | wx.OK)
+        sys.exit(2)
+    elif options.exit_after:
+        frame.ShowMessage(
+            "Command-line option '--exit-after' requires '--start-copy'",
+            "Error: Invalid command line",
+            wx.ICON_ERROR | wx.OK)
+        sys.exit(2)
+
     app.MainLoop()
