@@ -8,6 +8,7 @@ import lzo
 import os
 import operator
 import optparse
+import parted
 import re
 import stat
 import subprocess
@@ -212,98 +213,6 @@ partition_types = {
     0xff: "Xenix Bad Block Table",
 }
 
-def extended_tuple(typename, baseclass, additional_field_names, verbose=False):
-    """Returns a new subclass of tuple with named fields.
-
-    >>> Point = namedtuple('Point', 'x y')
-    >>> RoundedPoint = namedtuple('RoundedPoint', Point, 'radius')
-    """
-
-    # Parse and validate the field names.  Validation serves two purposes,
-    # generating informative error messages and preventing template injection attacks.
-    if isinstance(additional_field_names, basestring):
-        additional_field_names = additional_field_names.replace(',', ' ').split() # names separated by whitespace and/or commas
-    additional_field_names = tuple(map(str, additional_field_names))
-    for name in (typename,) + additional_field_names:
-        if not all(c.isalnum() or c=='_' for c in name):
-            raise ValueError('Type names and field names can only contain alphanumeric characters and underscores: %r' % name)
-        if keyword.iskeyword(name):
-            raise ValueError('Type names and field names cannot be a keyword: %r' % name)
-        if name[0].isdigit():
-            raise ValueError('Type names and field names cannot start with a number: %r' % name)
-    seen_names = set()
-    for name in additional_field_names:
-        if name.startswith('_'):
-            raise ValueError('Field names cannot start with an underscore: %r' % name)
-        if name in seen_names:
-            raise ValueError('Encountered duplicate field name: %r' % name)
-        seen_names.add(name)
-
-    # Create and fill-in the class template
-    numfields = len(baseclass._fields) + len(additional_field_names)
-    argtxt = repr(baseclass._fields + additional_field_names).replace("'",
-        "")[1:-1]   # tuple repr without parens or quotes
-    reprtxt = ', '.join('%s=%%r' % name for name in baseclass._fields +
-        additional_field_names)
-    dicttxt = ', '.join('%r: t[%d]' % (name, pos) for pos, name in
-        enumerate(baseclass._fields + additional_field_names))
-    baseclass_name = baseclass.__name__
-
-    template = '''
-import operator
-
-class %(typename)s(%(baseclass_name)s):
-        '%(typename)s(%(argtxt)s)' \n
-        __slots__ = () \n
-        _fields = %(additional_field_names)r \n
-        def __new__(_cls, %(argtxt)s):
-            return _tuple.__new__(_cls, (%(argtxt)s)) \n
-        @classmethod
-        def _make(cls, iterable, new=tuple.__new__, len=len):
-            'Make a new %(typename)s object from a sequence or iterable'
-            result = new(cls, iterable)
-            if len(result) != %(numfields)d:
-                raise TypeError('Expected %(numfields)d arguments, got %%d' %% len(result))
-            return result \n
-        def __repr__(self):
-            return '%(typename)s(%(reprtxt)s)' %% self \n
-        def _asdict(t):
-            'Return a new dict which maps field names to their values'
-            return {%(dicttxt)s} \n
-        def _replace(_self, **kwds):
-            'Return a new %(typename)s object replacing specified fields with new values'
-            result = _self._make(map(kwds.pop, %(additional_field_names)r, _self))
-            if kwds:
-                raise ValueError('Got unexpected field names: %%r' %% kwds.keys())
-            return result \n
-        def __getnewargs__(self):
-            return tuple(self) \n\n''' % locals()
-    for i, name in enumerate(additional_field_names):
-        template += '        %s = _property(operator.itemgetter(%d))\n' % (name, i)
-    if verbose:
-        print template
-
-    # Execute the template string in a temporary namespace and
-    # support tracing utilities by setting a value for frame.f_globals['__name__']
-    namespace = dict(__name__='namedtuple_%s' % typename,
-        _property=property, _tuple=tuple)
-    namespace[baseclass_name] = baseclass
-
-    try:
-        exec template in namespace
-    except SyntaxError, e:
-        raise SyntaxError("%s:\n%s" % (e, template))
-
-    result = namespace[typename]
-
-    # For pickling to work, the __module__ variable needs to be set to the frame
-    # where the named tuple is created.  Bypass this step in enviroments where
-    # sys._getframe is not defined (Jython for example).
-    if hasattr(sys, '_getframe'):
-        result.__module__ = sys._getframe(1).f_globals.get('__name__', '__main__')
-
-    return result
-
 def human_readable_size(bytes):
     """Utility function to convert a size in bytes into a human-readable
     formatted number for display. Uses the "SI" definition of a megabyte
@@ -386,8 +295,8 @@ class PermissionDeniedDisk(Disk):
         return "%s (permission denied, %s)" % (self.name,
             self.human_readable_size)
 
-class Partition(extended_tuple('PartitionTuple', BlockDevice,
-    'type_code desc')):
+class Partition(namedtuple('PartitionTuple', BlockDevice._fields + ('filesystem',)),
+    BlockDevice):
     """Represents an individual partition, a Block Device that has a
     partition type, mainly so that we display that partition type in
     the drop-down device list. Shows up as something like
@@ -399,6 +308,13 @@ class Partition(extended_tuple('PartitionTuple', BlockDevice,
     looked up from the partition_types, but currently the caller is
     expected to do this for us.
     """
+
+    @property
+    def desc(self):
+        if self.filesystem is None:
+            return "empty"
+        else:
+            return self.filesystem.type
 
     @property
     def listbox_label(self):
@@ -885,7 +801,6 @@ class EndpointUserInterface(object):
 class MainWindow(wx.Frame):
     def __init__(self):
         wx.Frame.__init__(self, None, -1, "Concur")
-        self.readPartitions()
         self.initialize()
 
     def readPartitions(self):
@@ -903,16 +818,17 @@ class MainWindow(wx.Frame):
             
             devpath = "/dev/%s" % devname
             
-            sfdisk = subprocess.Popen(['sfdisk', '-l', '-uS', devpath],
-                stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-            
-            if not sfdisk:
-                raise StandardError('sfdisk failed' % returnCode)
+            try:
+                pdev = parted.Device(devpath)
+                pdisk = parted.Disk(pdev)
+                devices.append(Disk(devname, disk_size))
                 
-            sfout = sfdisk.stdout
-            line = sfout.readline()
-
-            if line == ('%s: Permission denied\n' % devpath):
+                for ppart in pdisk.partitions:
+                    size = ppart.geometry.length * ppart.geometry.device.sectorSize
+                    part = Partition(name = ppart.path, size = size,
+                        filesystem = ppart.fileSystem)
+                    devices.append(part)
+            except OSError as e:            
                 devices.append(PermissionDeniedDisk(devname, disk_size))
                 
                 # alternative method, scan /sys/block/sda for subdirs
@@ -926,58 +842,6 @@ class MainWindow(wx.Frame):
                             partition_size = int(size_file.readline()) * 512
                         devices.append(UnknownPartition(partname,
                             partition_size))
-            else:
-                devices.append(Disk(devname, disk_size))
-            
-                if line != '\n':
-                    raise StandardError('Unknown output from sfdisk (1): %s' % line)
-                    
-                line = sfout.readline()
-                if not re.match(r'Disk /dev/' + devname + ': .*', line):
-                    raise StandardError('Unknown output from sfdisk (2): %s' % line)
-
-                line = sfout.readline()
-                
-                if line == 'Warning: extended partition does not start at a cylinder boundary.\n':
-                    line = sfout.readline()
-                    if line == 'DOS and Linux will interpret the contents differently.\n':
-                        line = sfout.readline()
-                
-                if not re.match(r'Units = sectors of 512 bytes, counting from 0.*', line):
-                    raise StandardError('Unknown output from sfdisk (3): %s' % line)
-
-                line = sfout.readline()
-                if line != '\n':
-                    raise StandardError('Unknown output from sfdisk (4): %s' % line)
-                    
-                #    Device Boot    Start       End   #sectors  Id  System
-                line = sfout.readline()
-                if not re.match(r'\s+Device\s+Boot\s+Start\s+End\s+#sectors' +
-                    '\s+Id\s+System', line):
-                    raise StandardError('Unknown output from sfdisk (5): %s' % line)
-
-                for line in sfout.readlines():
-                    # /dev/sda1   *      2048 607444991  607442944  83  Linux
-                    found = re.match('/dev/(' + devname + r'\d+)' +
-                        r'\s+(\*)?\s+\d+\s+\S+\s+(\d+)\s+(\S+)\s+(.+)', line)
-                    
-                    if not found:
-                        raise StandardError('Unknown line format from ' +
-                            'sfdisk for %s: %s' % (devname, line))
-                    
-                    if found.group(4) == '0':
-                        # empty partition table entry
-                        continue
-                        
-                    devices.append(Partition(found.group(1),
-                        int(found.group(3)) * 512,
-                        int(found.group(4), 16), found.group(5)))
-                
-                returnCode = sfdisk.wait()
-                if returnCode != 0:
-                    raise StandardError('sfdisk returned %d' % returnCode)
-                
-                sfout.close()
                 
     def addWithLabel(self, label, control, position):
         self.gridSizer.Add(wx.StaticText(self, label=label), position,
