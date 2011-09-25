@@ -19,6 +19,12 @@ from wx.lib.agw.genericmessagedialog import GenericMessageDialog as MessageDialo
 
 # http://www.win.tue.nl/~aeb/partitions/partition_types-1.html
 
+"""Mapping of partition type codes from the partition table (downloaded
+from http://www.win.tue.nl/~aeb/partitions/partition_types-1.html) to
+descriptive names, used to help identify partitions in the drop-down 
+lists, somewhat reformatted to reduce the width of the drop-down list
+box."""
+
 partition_types = {
     0x01: "DOS 12-bit FAT (up to 16 MB)",
     0x02: "XENIX root",
@@ -201,6 +207,11 @@ partition_types = {
     0xff: "Xenix Bad Block Table",
 }
 
+"""Utility function to convert a size in bytes into a human-readable
+formatted number for display. Uses the "SI" definition of a megabyte
+and a gigabyte, as disk manufacturers do, rather than the binary-based
+mebibyte and gigibyte favoured by purists and RAM modules."""
+
 def human_size(bytes):
     value = bytes
     units = "bytes"
@@ -219,65 +230,118 @@ def human_size(bytes):
     
     return "%.1f %s" % (value, units)
 
+"""Represents a generic block device, i.e. something which is represented
+by a device node under /dev, and can store a fixed number of bytes."""
+
 class BlockDevice(object):
+    """Constructor arguments: name is the device name without /dev
+    (e.g. sda1), size is the size in bytes."""
     def __init__(self, name, size):
         self._name = name
         self._size = size
 
+    """The name property of a BlockDevice is the device node name without
+    the /dev prefix, for example "sda2"."""
     @property
     def name(self):
         return self._name
 
+    """The size of the BlockDevice in bytes."""
     @property
     def size(self):
         return self._size
 
+    """Returns the human-readable version of the block device size.
+    Read-only property."""
     @property
     def humanSize(self):
         return human_size(self._size)
 
+    """Returns the device name (in the filesystem), used for permission
+    checks before imaging starts."""
     @property
     def NodeName(self):
         return "/dev/%s" % self.name
 
+    """Returns a short string describing the block device, in this case
+    just its device node name. This is used as the description property
+    of a LocalDevice endpoint that wraps this block device."""
     @property
     def conciseString(self):
         return self.NodeName
 
+"""Represents an entire disk, a BlockDevice which can contain a partition
+table."""
 class Disk(BlockDevice):
+    """HumanLabel is the name shown in the drop-down list of block 
+    devices (disks and partitions)."""
     @property
     def HumanLabel(self):
         return "%s (Disk, %s)" % (self.name, self.humanSize)
 
+"""Represents a disk that we don't have permission to open, so we can't find
+out much about the sizes or types of the partitions on it. We add this to the
+device list instead of a Disk to indicate to the user that they won't be able
+to read or write it unless they fix the permissions issue, for example by
+running concur as root or giving themselves access to the device node under
+/dev. Shows up as something like "/dev/sda (permission denied, 120 GB)" in the
+device list."""
+
 class PermissionDeniedDisk(Disk):
+    """HumanLabel is the name shown in the drop-down list of block 
+    devices (disks and partitions). PermissionDeniedDisk devices
+    show up as something like "/dev/sda (permission denied, 120 GB)"."""
     @property
     def HumanLabel(self):
         return "%s (permission denied, %s)" % (self.name, self.humanSize)
 
+"""Represents an individual partition, a Block Device that has a partition
+type, mainly so that we display that partition type in the drop-down
+device list. Shows up as something like "/dev/sda1 (NTFS, 119 GB)" in the
+device list."""
+
 class Partition(BlockDevice):
+    """Constructor arguments: name and size are passed directly to
+    BlockDevice, type is the partition type code, and desc is the 
+    descriptive version of the partition type code, which can be
+    looked up from the partition_types, but currently the caller is
+    expected to do this for us."""
     def __init__(self, name, size, type=0, desc=None):
         BlockDevice.__init__(self, name, size)
         self._type = type
         self._desc = desc
 
+    """Returns the partition type code. Read-only."""
     @property
     def type(self):
         return self._type
 
+    """Returns the partition type descriptive text. Read-only."""
     @property
     def desc(self):
         return self._desc
     
+    """Returns the human-readable description of the partition, for the
+    drop-down list box. Read-only."""
     @property
     def HumanLabel(self):
         return "%s (%s, %s)" % (self.name, self.desc,
             self.humanSize)
 
+"""Represents a partition of unknown size, usually because the disk
+that it's stored on is not readable."""
 class UnknownPartition(BlockDevice):
     @property
     def HumanLabel(self):
         return "%s (unknown type, %s)" % (self.name, self.humanSize)
 
+"""Represents a place where image data can be stored or retrieved from.
+Endpoints are very generic, including network shares, network multicasting,
+block devices and files. Specific endpoint classes derive from Endpoint.
+These classes are used to represent the options in the Source and
+Destination lists, and tell the GUI whether to display or hide certain
+options depending on the nature of the endpoint, such as whether to 
+prompt the user for a user name and password when using this endpoint."""
 class Endpoint(object):
     @property
     def name(self):
