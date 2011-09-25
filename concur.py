@@ -2,13 +2,18 @@
 # -*- coding: utf-8 -*-
 
 import fcntl
+import inspect
+import keyword
 import lzo
 import os
+import operator
 import optparse
 import re
 import stat
 import subprocess
 import sys
+
+from collections import namedtuple
 
 try:
     import wx
@@ -207,12 +212,104 @@ partition_types = {
     0xff: "Xenix Bad Block Table",
 }
 
-"""Utility function to convert a size in bytes into a human-readable
-formatted number for display. Uses the "SI" definition of a megabyte
-and a gigabyte, as disk manufacturers do, rather than the binary-based
-mebibyte and gigibyte favoured by purists and RAM modules."""
+def extended_tuple(typename, baseclass, additional_field_names, verbose=False):
+    """Returns a new subclass of tuple with named fields.
 
-def human_size(bytes):
+    >>> Point = namedtuple('Point', 'x y')
+    >>> RoundedPoint = namedtuple('RoundedPoint', Point, 'radius')
+    """
+
+    # Parse and validate the field names.  Validation serves two purposes,
+    # generating informative error messages and preventing template injection attacks.
+    if isinstance(additional_field_names, basestring):
+        additional_field_names = additional_field_names.replace(',', ' ').split() # names separated by whitespace and/or commas
+    additional_field_names = tuple(map(str, additional_field_names))
+    for name in (typename,) + additional_field_names:
+        if not all(c.isalnum() or c=='_' for c in name):
+            raise ValueError('Type names and field names can only contain alphanumeric characters and underscores: %r' % name)
+        if keyword.iskeyword(name):
+            raise ValueError('Type names and field names cannot be a keyword: %r' % name)
+        if name[0].isdigit():
+            raise ValueError('Type names and field names cannot start with a number: %r' % name)
+    seen_names = set()
+    for name in additional_field_names:
+        if name.startswith('_'):
+            raise ValueError('Field names cannot start with an underscore: %r' % name)
+        if name in seen_names:
+            raise ValueError('Encountered duplicate field name: %r' % name)
+        seen_names.add(name)
+
+    # Create and fill-in the class template
+    numfields = len(baseclass._fields) + len(additional_field_names)
+    argtxt = repr(baseclass._fields + additional_field_names).replace("'",
+        "")[1:-1]   # tuple repr without parens or quotes
+    reprtxt = ', '.join('%s=%%r' % name for name in baseclass._fields +
+        additional_field_names)
+    dicttxt = ', '.join('%r: t[%d]' % (name, pos) for pos, name in
+        enumerate(baseclass._fields + additional_field_names))
+    baseclass_name = baseclass.__name__
+
+    template = '''
+import operator
+
+class %(typename)s(%(baseclass_name)s):
+        '%(typename)s(%(argtxt)s)' \n
+        __slots__ = () \n
+        _fields = %(additional_field_names)r \n
+        def __new__(_cls, %(argtxt)s):
+            return _tuple.__new__(_cls, (%(argtxt)s)) \n
+        @classmethod
+        def _make(cls, iterable, new=tuple.__new__, len=len):
+            'Make a new %(typename)s object from a sequence or iterable'
+            result = new(cls, iterable)
+            if len(result) != %(numfields)d:
+                raise TypeError('Expected %(numfields)d arguments, got %%d' %% len(result))
+            return result \n
+        def __repr__(self):
+            return '%(typename)s(%(reprtxt)s)' %% self \n
+        def _asdict(t):
+            'Return a new dict which maps field names to their values'
+            return {%(dicttxt)s} \n
+        def _replace(_self, **kwds):
+            'Return a new %(typename)s object replacing specified fields with new values'
+            result = _self._make(map(kwds.pop, %(additional_field_names)r, _self))
+            if kwds:
+                raise ValueError('Got unexpected field names: %%r' %% kwds.keys())
+            return result \n
+        def __getnewargs__(self):
+            return tuple(self) \n\n''' % locals()
+    for i, name in enumerate(additional_field_names):
+        template += '        %s = _property(operator.itemgetter(%d))\n' % (name, i)
+    if verbose:
+        print template
+
+    # Execute the template string in a temporary namespace and
+    # support tracing utilities by setting a value for frame.f_globals['__name__']
+    namespace = dict(__name__='namedtuple_%s' % typename,
+        _property=property, _tuple=tuple)
+    namespace[baseclass_name] = baseclass
+
+    try:
+        exec template in namespace
+    except SyntaxError, e:
+        raise SyntaxError("%s:\n%s" % (e, template))
+
+    result = namespace[typename]
+
+    # For pickling to work, the __module__ variable needs to be set to the frame
+    # where the named tuple is created.  Bypass this step in enviroments where
+    # sys._getframe is not defined (Jython for example).
+    if hasattr(sys, '_getframe'):
+        result.__module__ = sys._getframe(1).f_globals.get('__name__', '__main__')
+
+    return result
+
+def human_readable_size(bytes):
+    """Utility function to convert a size in bytes into a human-readable
+    formatted number for display. Uses the "SI" definition of a megabyte
+    and a gigabyte, as disk manufacturers do, rather than the binary-based
+    mebibyte and gigibyte favoured by purists and RAM modules."""
+
     value = bytes
     units = "bytes"
     
@@ -230,110 +327,92 @@ def human_size(bytes):
     
     return "%.1f %s" % (value, units)
 
-"""Represents a generic block device, i.e. something which is represented
-by a device node under /dev, and can store a fixed number of bytes."""
-
-class BlockDevice(object):
-    """Constructor arguments: name is the device name without /dev
+class BlockDevice(namedtuple('BlockDeviceTuple', 'name size')):
+    """Represents a generic block device, i.e. something which is
+    represented by a device node under /dev, and can store a fixed
+    number of bytes.
+    
+    Constructor arguments: name is the device name without /dev
     (e.g. sda1), size is the size in bytes."""
-    def __init__(self, name, size):
-        self._name = name
-        self._size = size
-
-    """The name property of a BlockDevice is the device node name without
-    the /dev prefix, for example "sda2"."""
+    
     @property
-    def name(self):
-        return self._name
+    def human_readable_size(self):
+        """Returns the human-readable version of the block device size.
+        Read-only property."""
+        return human_readable_size(self.size)
 
-    """The size of the BlockDevice in bytes."""
     @property
-    def size(self):
-        return self._size
-
-    """Returns the human-readable version of the block device size.
-    Read-only property."""
-    @property
-    def humanSize(self):
-        return human_size(self._size)
-
-    """Returns the device name (in the filesystem), used for permission
-    checks before imaging starts."""
-    @property
-    def NodeName(self):
+    def device_node(self):
+        """Returns the device name (in the filesystem), used for permission
+        checks before imaging starts."""
         return "/dev/%s" % self.name
 
-    """Returns a short string describing the block device, in this case
-    just its device node name. This is used as the description property
-    of a LocalDevice endpoint that wraps this block device."""
     @property
-    def conciseString(self):
-        return self.NodeName
+    def very_short_desc(self):
+        """Returns a short string describing the block device, in this case
+        just its device node name. This is used as the description property
+        of a LocalDevice endpoint that wraps this block device."""
+        return self.device_node
 
-"""Represents an entire disk, a BlockDevice which can contain a partition
-table."""
 class Disk(BlockDevice):
-    """HumanLabel is the name shown in the drop-down list of block 
-    devices (disks and partitions)."""
+    """Represents an entire disk, a BlockDevice which can contain a
+    partition table."""
+    
     @property
-    def HumanLabel(self):
-        return "%s (Disk, %s)" % (self.name, self.humanSize)
-
-"""Represents a disk that we don't have permission to open, so we can't find
-out much about the sizes or types of the partitions on it. We add this to the
-device list instead of a Disk to indicate to the user that they won't be able
-to read or write it unless they fix the permissions issue, for example by
-running concur as root or giving themselves access to the device node under
-/dev. Shows up as something like "/dev/sda (permission denied, 120 GB)" in the
-device list."""
+    def listbox_label(self):
+        """listbox_label is the name shown in the drop-down list of block 
+        devices (disks and partitions)."""
+        return "%s (Disk, %s)" % (self.name, self.human_readable_size)
 
 class PermissionDeniedDisk(Disk):
-    """HumanLabel is the name shown in the drop-down list of block 
-    devices (disks and partitions). PermissionDeniedDisk devices
-    show up as something like "/dev/sda (permission denied, 120 GB)"."""
+    """Represents a disk that we don't have permission to open, so we
+    can't find out much about the sizes or types of the partitions on
+    it. 
+    
+    We add this to the device list instead of a Disk to indicate to the
+    user that they won't be able to read or write it unless they fix
+    the permissions issue, for example by running concur as root or
+    giving themselves access to the device node under /dev.
+    
+    Shows up as something like "/dev/sda (permission denied, 120 GB)"
+    in the device list."""
+
     @property
-    def HumanLabel(self):
-        return "%s (permission denied, %s)" % (self.name, self.humanSize)
+    def listbox_label(self):
+        """listbox_label is the name shown in the drop-down list of
+        block devices (disks and partitions). PermissionDeniedDisk
+        devices show up as something like "/dev/sda (permission denied,
+        120 GB)"."""
+        return "%s (permission denied, %s)" % (self.name,
+            self.human_readable_size)
 
-"""Represents an individual partition, a Block Device that has a partition
-type, mainly so that we display that partition type in the drop-down
-device list. Shows up as something like "/dev/sda1 (NTFS, 119 GB)" in the
-device list."""
-
-class Partition(BlockDevice):
-    """Constructor arguments: name and size are passed directly to
+class Partition(extended_tuple('PartitionTuple', BlockDevice,
+    'type_code desc')):
+    """Represents an individual partition, a Block Device that has a
+    partition type, mainly so that we display that partition type in
+    the drop-down device list. Shows up as something like
+    "/dev/sda1 (NTFS, 119 GB)" in the device list.
+    
+    Constructor arguments: name and size are passed directly to
     BlockDevice, type is the partition type code, and desc is the 
     descriptive version of the partition type code, which can be
     looked up from the partition_types, but currently the caller is
-    expected to do this for us."""
-    def __init__(self, name, size, type=0, desc=None):
-        BlockDevice.__init__(self, name, size)
-        self._type = type
-        self._desc = desc
+    expected to do this for us.
+    """
 
-    """Returns the partition type code. Read-only."""
     @property
-    def type(self):
-        return self._type
-
-    """Returns the partition type descriptive text. Read-only."""
-    @property
-    def desc(self):
-        return self._desc
-    
-    """Returns the human-readable description of the partition, for the
-    drop-down list box. Read-only."""
-    @property
-    def HumanLabel(self):
+    def listbox_label(self):
+        """Returns the human-readable description of the partition,
+        for the drop-down list box. Read-only."""
         return "%s (%s, %s)" % (self.name, self.desc,
-            self.humanSize)
+            self.human_readable_size)
 
 """Represents a partition of unknown size, usually because the disk
 that it's stored on is not readable."""
 class UnknownPartition(BlockDevice):
     @property
-    def HumanLabel(self):
-        return "%s (unknown type, %s)" % (self.name, self.humanSize)
+    def listbox_label(self):
+        return "%s (unknown type, %s)" % (self.name, self.human_readable_size)
 
 """Represents a place where image data can be stored or retrieved from.
 Endpoints are very generic, including network shares, network multicasting,
@@ -384,14 +463,14 @@ class Endpoint(object):
     # without corrupting this one, or vice versa
     def overlaps(self, other):
         if self.HasDevice:
-            myDevice = self.DeviceNode.NodeName
+            myDevice = self.DeviceNode.device_node
         elif self.HasImageFile:
             myDevice = self.imageFileDevice
         else:
             return False # we don't need a device, so can't conflict
 
         if other.HasDevice:
-            return IsDeviceOverlap(myDevice, other.DeviceNode.NodeName)
+            return IsDeviceOverlap(myDevice, other.DeviceNode.device_node)
         elif other.HasImageFile:
             return IsDeviceOverlap(myDevice, other.imageFileDevice)
         else:
@@ -441,11 +520,11 @@ class LocalDevice(Endpoint):
 
     @property
     def description(self):
-        return self._device.conciseString
+        return self._device.very_short_desc
 
     @property
     def inUse(self):
-        myDevice = self._device.NodeName
+        myDevice = self._device.device_node
         
         with open("/etc/mtab") as mtab:
             for line in mtab:
@@ -478,23 +557,23 @@ class LocalDevice(Endpoint):
         return False
 
     def OpenInput(self):
-        handle = open(self._device.NodeName, "rb")
+        handle = open(self._device.device_node, "rb")
         self._SetInput(handle)
         return handle
         # caller must close handle when done
 
     def OpenOutput(self):
-        handle = open(self._device.NodeName, "wb")
+        handle = open(self._device.device_node, "wb")
         self._SetOutput(handle)
         return handle
         # caller must close handle when done
 
     def overlaps(self, other):
         if other.HasDevice:
-            return IsDeviceOverlap(self.DeviceNode.NodeName,
-                other.DeviceNode.NodeName)
+            return IsDeviceOverlap(self.DeviceNode.device_node,
+                other.DeviceNode.device_node)
         elif other.HasImageFile:
-            return IsDeviceOverlap(self.DeviceNode.NodeName,
+            return IsDeviceOverlap(self.DeviceNode.device_node,
                 other.imageFileDevice)
         
     @property
@@ -712,7 +791,7 @@ class EndpointUserInterface(object):
         
     def Refresh(self):
         oldLabel = self.devBox.StringSelection
-        self.devBox.Items = [dev.HumanLabel for dev in devices]
+        self.devBox.Items = [dev.listbox_label for dev in devices]
         found = False
 
         for i, label in enumerate(self.devBox.Items):
@@ -787,7 +866,7 @@ class EndpointUserInterface(object):
             foundDeviceIndex = None
             
             for i, dev in enumerate(devices):
-                devstats = os.stat(dev.NodeName)
+                devstats = os.stat(dev.device_node)
                 if devstats.st_rdev == statinfo.st_rdev:
                     foundDeviceIndex = i
 
